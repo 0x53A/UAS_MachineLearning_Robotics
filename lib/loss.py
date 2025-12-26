@@ -102,45 +102,19 @@ class SymbolicLoss:
                            for losses that don't vectorize properly (e.g., those using
                            Abs, Piecewise, etc.).
         """
+        # Create symbols with real=True assumption for proper differentiation
         y_pred = sp.Symbol(pred_var, real=True)
         y_true = sp.Symbol(target_var, real=True)
-        expr = sp.sympify(expression)
+
+        # Parse the expression, then substitute in our properly-typed symbols
+        # This ensures differentiation works correctly (e.g., for Abs)
+        expr_parsed = sp.sympify(expression)
+        old_pred = sp.Symbol(pred_var)  # Symbol without assumptions from sympify
+        old_true = sp.Symbol(target_var)
+        expr = expr_parsed.subs([(old_pred, y_pred), (old_true, y_true)])
+
         return SymbolicLoss._make(y_pred, y_true, expr, name, supports_batch)
 
     def hash_expr(self):
         """Get a hash of the symbolic expression."""
         return hashlib.sha256(str(self.expression).encode()).hexdigest()[:16]
-
-    @staticmethod
-    def huber(delta: float = 1.0):
-        """Huber loss using symbolic piecewise expression.
-
-        Note: This loss does not support batch processing due to the piecewise
-        nature of the expression. Training will fall back to sample-by-sample
-        processing when using this loss.
-        """
-        y_pred = sp.Symbol("y_pred", real=True)
-        y_true = sp.Symbol("y_true", real=True)
-        error = y_pred - y_true
-        abs_error = sp.Abs(error)
-
-        # Huber loss: 0.5 * error^2 for |error| <= delta, else delta * (|error| - 0.5 * delta)
-        expr = sp.Piecewise(
-            (sp.Rational(1, 2) * error**2, abs_error <= delta),
-            (delta * (abs_error - sp.Rational(1, 2) * delta), True),
-        )
-
-        return SymbolicLoss._make(y_pred, y_true, expr, "huber", supports_batch=False)
-
-    @staticmethod
-    def mae():
-        """Mean Absolute Error loss using symbolic Abs expression.
-
-        Note: This loss does not support batch processing due to the Abs function.
-        Training will fall back to sample-by-sample processing when using this loss.
-        """
-        y_pred = sp.Symbol("y_pred", real=True)
-        y_true = sp.Symbol("y_true", real=True)
-        expr = sp.Abs(y_pred - y_true)
-
-        return SymbolicLoss._make(y_pred, y_true, expr, "mae", supports_batch=False)
