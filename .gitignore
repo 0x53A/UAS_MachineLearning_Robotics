@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+
+.net_cache
+
+.ruff_cache
