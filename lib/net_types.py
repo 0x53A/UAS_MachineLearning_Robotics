@@ -1,15 +1,13 @@
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Callable, Dict, Any
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict, Any, TYPE_CHECKING
 from enum import Enum
 import numpy as np
-import sympy as sp
-import hashlib
-import json
-from pathlib import Path
 
 from lib.activation import SymbolicActivation
-from lib.caching import CheckpointConfig, TrainingState
 from lib.loss import SymbolicLoss
+
+if TYPE_CHECKING:
+    from lib.caching import CheckpointConfig
 
 
 @dataclass
@@ -58,11 +56,6 @@ class NetConfig:
     weight_init: WeightInit = WeightInit.XAVIER
     bias_init_std: float = 0.0
     seed: int = 42
-
-
-def compute_data_hash(inputs: List[np.ndarray], targets: List[np.ndarray]) -> str:
-    combined = np.concatenate([np.concatenate(inputs), np.concatenate(targets)])
-    return hashlib.sha256(combined.tobytes()).hexdigest()[:16]
 
 
 @dataclass
@@ -224,253 +217,6 @@ class Net:
             return np.mean(result, axis=1)
         return result
 
-    def _compute_config_hash(
-        self,
-        learning_rate: float,
-        batch_size: Optional[int],
-        data_hash: Optional[str],
-    ):
-        config_dict = {
-            "n_inputs": len(self.layers[0].neurons[0].connections),
-            "n_outputs": len(self.layers[-1].neurons),
-            "n_hidden_layers": len(self.layers) - 1,
-            "n_neurons_per_hidden": len(self.layers[0].neurons),
-            "hidden_activation_hash": self.layers[0].activation_func.hash_expr(),
-            "output_activation_hash": self.layers[-1].activation_func.hash_expr(),
-            "loss_func_hash": self.loss_func.hash_expr(),
-            "learning_rate": learning_rate,
-            "batch_size": batch_size,
-            "data_hash": data_hash or "no_data_hash",
-            "seed": self.seed,
-        }
-
-        config_str = json.dumps(config_dict, sort_keys=True)
-        return hashlib.sha256(config_str.encode()).hexdigest()[:16]
-
-    def _get_cache_path(self, cache_dir: str, config_hash: str) -> Path:
-        cache_path = Path(cache_dir) / f"net_{config_hash}"
-        cache_path.mkdir(parents=True, exist_ok=True)
-        return cache_path
-
-    def _save_checkpoint(
-        self,
-        cache_dir: str,
-        config_hash: str,
-        epoch: int,
-        weights: List[np.ndarray],
-        biases: List[np.ndarray],
-        loss_history: List[float],
-    ):
-        cache_path = self._get_cache_path(cache_dir, config_hash)
-        checkpoint_path = cache_path / f"checkpoint_epoch_{epoch}.npz"
-        latest_path = cache_path / "latest.npz"
-
-        state = {
-            "epoch": epoch,
-            "loss_history": np.array(loss_history),
-            "num_layers": len(weights),
-        }
-
-        for i, w in enumerate(weights):
-            state[f"weights_{i}"] = w
-
-        for i, b in enumerate(biases):
-            state[f"biases_{i}"] = b
-
-        np.savez(latest_path, **state)
-        np.savez(checkpoint_path, **state)
-
-    def _load_checkpoint(
-        self,
-        cache_dir: str,
-        config_hash: str,
-    ) -> Optional[TrainingState]:
-        cache_path = self._get_cache_path(cache_dir, config_hash)
-        latest_path = cache_path / "latest.npz"
-
-        if not latest_path.exists():
-            return None
-
-        try:
-            data = np.load(latest_path, allow_pickle=True)
-            num_layers = int(data["num_layers"])
-
-            weights = [data[f"weights_{i}"] for i in range(num_layers)]
-            biases = [data[f"biases_{i}"] for i in range(num_layers)]
-
-            return TrainingState(
-                weights=weights,
-                biases=biases,
-                epoch=int(data["epoch"]),
-                loss_history=list(data["loss_history"]),
-            )
-        except Exception:
-            return None
-
-    def _train_sample_by_sample(
-        self,
-        inputs: List[np.ndarray],
-        targets: List[np.ndarray],
-        learning_rate: float,
-    ) -> float:
-        """Train for one epoch, processing samples one at a time."""
-        n_samples = len(inputs)
-        epoch_loss = 0.0
-
-        for i in range(n_samples):
-            activations, pre_activations = self.forward(inputs[i])
-            y_pred = activations[-1]
-            loss = self.compute_loss(y_pred, targets[i])
-            epoch_loss += loss
-
-            d_weights, d_biases = self.backward(
-                y_pred, targets[i], activations, pre_activations
-            )
-
-            weights, biases = self._to_arrays()
-            for layer_idx in range(len(weights)):
-                for neuron_idx in range(len(weights[layer_idx])):
-                    biases[layer_idx][neuron_idx] -= (
-                        learning_rate * d_biases[layer_idx][neuron_idx]
-                    )
-                    for conn_idx in range(len(weights[layer_idx][neuron_idx])):
-                        weights[layer_idx][neuron_idx][conn_idx] -= (
-                            learning_rate * d_weights[layer_idx][neuron_idx][conn_idx]
-                        )
-
-            self._from_arrays(weights, biases)
-
-        return epoch_loss
-
-    def _train_batch(
-        self,
-        inputs: List[np.ndarray],
-        targets: List[np.ndarray],
-        learning_rate: float,
-        batch_size: int,
-    ) -> float:
-        """Train for one epoch using mini-batch processing."""
-        n_samples = len(inputs)
-        epoch_loss = 0.0
-
-        for batch_start in range(0, n_samples, batch_size):
-            batch_end = min(batch_start + batch_size, n_samples)
-            batch_inputs = np.array([inputs[i] for i in range(batch_start, batch_end)])
-            batch_targets = np.array(
-                [targets[i] for i in range(batch_start, batch_end)]
-            )
-
-            activations, pre_activations = self.forward_batch(batch_inputs)
-            y_pred_batch = activations[-1]
-            loss_batch = self.compute_loss_batch(y_pred_batch, batch_targets)
-            epoch_loss += np.sum(loss_batch)
-
-            d_weights, d_biases = self.backward_batch(
-                y_pred_batch, batch_targets, activations, pre_activations
-            )
-
-            batch_size_actual = batch_end - batch_start
-            weights, biases = self._to_arrays()
-            for layer_idx in range(len(weights)):
-                biases[layer_idx] -= (learning_rate / batch_size_actual) * d_biases[
-                    layer_idx
-                ]
-                weights[layer_idx] -= (learning_rate / batch_size_actual) * d_weights[
-                    layer_idx
-                ]
-
-            self._from_arrays(weights, biases)
-
-        return epoch_loss
-
-    def train(
-        self,
-        inputs: List[np.ndarray],
-        targets: List[np.ndarray],
-        learning_rate: float,
-        epochs: int,
-        batch_size: Optional[int] = None,
-        checkpoint_config: Optional[CheckpointConfig] = None,
-    ) -> Dict[str, Any]:
-        n_samples = len(inputs)
-        loss_history: List[float] = []
-        start_epoch = 0
-        config_hash = None
-
-        # Determine if we can use batch processing
-        # If the loss function doesn't support batching, we fall back to sample-by-sample
-        use_batch = (
-            batch_size is not None
-            and batch_size < n_samples
-            and self.loss_func.supports_batch
-        )
-
-        if checkpoint_config and checkpoint_config.enabled:
-            config_hash = self._compute_config_hash(
-                learning_rate, batch_size, checkpoint_config.data_hash
-            )
-            self._config_hash = config_hash
-
-            loaded_state = self._load_checkpoint(
-                checkpoint_config.cache_dir, config_hash
-            )
-            if loaded_state and not checkpoint_config.overwrite:
-                # Only continue from checkpoint if we haven't already trained enough
-                if loaded_state.epoch < epochs:
-                    start_epoch = loaded_state.epoch
-                    loss_history = loaded_state.loss_history[:start_epoch]
-                    self._from_arrays(loaded_state.weights, loaded_state.biases)
-                    print(
-                        f"Loaded checkpoint from epoch {start_epoch}, "
-                        f"continuing to epoch {epochs}..."
-                    )
-                else:
-                    # Checkpoint has enough or more epochs than requested
-                    # Load the weights and truncate loss history to requested epochs
-                    self._from_arrays(loaded_state.weights, loaded_state.biases)
-                    loss_history = loaded_state.loss_history[:epochs]
-                    print(
-                        f"Loaded checkpoint from epoch {loaded_state.epoch}, "
-                        f"returning first {epochs} epochs of loss history."
-                    )
-                    return {"loss_history": loss_history}
-            elif loaded_state and checkpoint_config.overwrite:
-                print("Checkpoint found but overwrite=True, training from scratch...")
-            else:
-                start_epoch = 0
-
-        for epoch in range(start_epoch, epochs):
-            if use_batch and batch_size is not None:
-                epoch_loss = self._train_batch(
-                    inputs, targets, learning_rate, batch_size
-                )
-            else:
-                epoch_loss = self._train_sample_by_sample(
-                    inputs, targets, learning_rate
-                )
-
-            avg_loss = epoch_loss / n_samples
-            loss_history.append(avg_loss)
-
-            if (
-                checkpoint_config
-                and checkpoint_config.enabled
-                and config_hash is not None
-                and (epoch + 1) % checkpoint_config.checkpoint_interval == 0
-            ):
-                weights, biases = self._to_arrays()
-                self._save_checkpoint(
-                    checkpoint_config.cache_dir,
-                    config_hash,
-                    epoch + 1,
-                    weights,
-                    biases,
-                    loss_history,
-                )
-                print(f"Saved checkpoint at epoch {epoch + 1}")
-
-        return {"loss_history": loss_history}
-
     @staticmethod
     def fully_connected(config: "NetConfig") -> "Net":
         """Create a fully connected neural network from config."""
@@ -531,3 +277,29 @@ class Net:
         net = Net(layers=layers, loss_func=config.loss_func)
         net.seed = config.seed
         return net
+
+    def train(
+        self,
+        inputs: List[np.ndarray],
+        targets: List[np.ndarray],
+        learning_rate: float,
+        epochs: int,
+        batch_size: Optional[int] = None,
+        checkpoint_config: Optional["CheckpointConfig"] = None,
+    ) -> Dict[str, Any]:
+        """
+        Train the neural network.
+
+        This is a convenience method that delegates to lib.training.train().
+        """
+        from lib.training import train as train_fn
+
+        return train_fn(
+            self,
+            inputs,
+            targets,
+            learning_rate,
+            epochs,
+            batch_size,
+            checkpoint_config,
+        )
