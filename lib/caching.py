@@ -74,7 +74,6 @@ def save_checkpoint(
     """Save a training checkpoint to disk."""
     cache_path = get_cache_path(cache_dir, config_hash)
     checkpoint_path = cache_path / f"checkpoint_epoch_{epoch}.npz"
-    latest_path = cache_path / "latest.npz"
 
     state = {
         "epoch": epoch,
@@ -88,14 +87,13 @@ def save_checkpoint(
     for i, b in enumerate(biases):
         state[f"biases_{i}"] = b
 
-    np.savez(latest_path, **state)
     np.savez(checkpoint_path, **state)
 
 
 def load_checkpoint(
     cache_dir: str,
     config_hash: str,
-    target_epoch: Optional[int] = None,
+    target_epoch: int = None,
 ) -> Optional[TrainingState]:
     """
     Load a training checkpoint from disk.
@@ -103,41 +101,34 @@ def load_checkpoint(
     Args:
         cache_dir: Directory where checkpoints are stored
         config_hash: Hash identifying the network configuration
-        target_epoch: If specified, only return a checkpoint with at most this many epochs.
+        target_epoch: Only return a checkpoint with at most this many epochs.
                      We can continue training from epoch N to target_epoch, but we can't
                      "untrain" from a checkpoint that has more epochs than requested.
-                     If None, loads the latest checkpoint regardless of epoch count.
 
     Returns:
         TrainingState if a valid checkpoint is found, None otherwise.
     """
     cache_path = get_cache_path(cache_dir, config_hash)
 
-    if target_epoch is not None:
-        # Find the best checkpoint: highest epoch that doesn't exceed target_epoch
-        best_checkpoint_path = None
-        best_epoch = 0
+    # Find the best checkpoint: highest epoch that doesn't exceed target_epoch
+    best_checkpoint_path = None
+    best_epoch = 0
 
-        # Check all checkpoint files
-        for checkpoint_file in cache_path.glob("checkpoint_epoch_*.npz"):
-            try:
-                epoch_str = checkpoint_file.stem.replace("checkpoint_epoch_", "")
-                epoch = int(epoch_str)
-                if epoch <= target_epoch and epoch > best_epoch:
-                    best_epoch = epoch
-                    best_checkpoint_path = checkpoint_file
-            except ValueError:
-                continue
+    # Check all checkpoint files
+    for checkpoint_file in cache_path.glob("checkpoint_epoch_*.npz"):
+        try:
+            epoch_str = checkpoint_file.stem.replace("checkpoint_epoch_", "")
+            epoch = int(epoch_str)
+            if (target_epoch is None or epoch <= target_epoch) and epoch > best_epoch:
+                best_epoch = epoch
+                best_checkpoint_path = checkpoint_file
+        except ValueError:
+            continue
 
-        if best_checkpoint_path is None:
-            return None
+    if best_checkpoint_path is None:
+        return None
 
-        checkpoint_path = best_checkpoint_path
-    else:
-        # No target epoch specified, use latest
-        checkpoint_path = cache_path / "latest.npz"
-        if not checkpoint_path.exists():
-            return None
+    checkpoint_path = best_checkpoint_path
 
     try:
         data = np.load(checkpoint_path, allow_pickle=True)
